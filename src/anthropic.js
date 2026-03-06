@@ -128,7 +128,17 @@ dotenv.config();
 const app = express();
 const PORT = 3005;
 
-app.use(cors({ origin: ["http://localhost:8080", "http://localhost:3000", "http://localhost:5173"] }));
+const localOriginPattern = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || localOriginPattern.test(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
+  })
+);
 app.use(express.json({ limit: "10mb" }));
 
 // ── Groq API proxy ─────────────────────────────────────────────────────────────
