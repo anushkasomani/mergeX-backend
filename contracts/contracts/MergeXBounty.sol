@@ -14,13 +14,17 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  *   2. Org creates bounties (one per GitHub issue) — or batch-imports open issues
  *   3. Contributor calls takeBounty() + stakes 10-20% collateral → ASSIGNED
  *   4. Contributor opens a PR, calls submitPR() to record the PR URL on-chain → PR_SUBMITTED
- *   5. Org merges the PR on GitHub, calls approveMerge() on-chain → MERGED
- *   6. Contributor calls claimBounty() → receives bounty reward + stake back → COMPLETED
+ *   5a. Org merges the PR on GitHub → calls approveMerge() → MERGED
+ *       Contributor calls claimBounty() → receives bounty + full stake → COMPLETED
+ *   5b. Org rejects the PR → calls rejectPR() → bounty reopens, contributor gets full stake back
  *
- * Expiry:
- *   - If deadline passes while ASSIGNED (no PR yet) → contributor claims stake back, bounty reopens
- *   - If deadline passes while PR_SUBMITTED → contributor can still claim stake back, bounty reopens
- *     (org had time to review; if they didn't merge it's on them — contributor gets stake)
+ * Expiry rules:
+ *   - Deadline passed, status ASSIGNED (no PR submitted):
+ *       contributor gets 50% stake back, 50% slashed to repo pool (penalty for abandonment)
+ *       bounty reopens
+ *   - Deadline passed, status PR_SUBMITTED (org never responded):
+ *       contributor gets full stake back (org's fault for not reviewing)
+ *       bounty reopens
  */
 contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
 
@@ -45,9 +49,11 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
 
     event BountyTaken(uint256 indexed bountyId, address indexed contributor, uint256 deadline, uint256 stake);
     event PRSubmitted(uint256 indexed bountyId, address indexed contributor, string prUrl);
+    event PRRejected(uint256 indexed bountyId, address indexed org, string prUrl, uint256 stakeReturned);
     event MergeApproved(uint256 indexed bountyId, address indexed org, string prUrl);
     event BountyClaimed(uint256 indexed bountyId, address indexed contributor, uint256 reward);
-    event BountyExpired(uint256 indexed bountyId, address indexed contributor, BountyStatus statusAtExpiry);
+    // stakeReturned = amount actually sent back; slashedAmount = amount added to repo pool
+    event BountyExpired(uint256 indexed bountyId, address indexed contributor, BountyStatus statusAtExpiry, uint256 stakeReturned, uint256 slashedAmount);
 
     event StakeWithdrawn(address indexed contributor, uint256 amount);
 
@@ -125,6 +131,8 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     uint256 public constant MIN_ORG_STAKE             = 0.000001 ether;
     uint256 public constant CONTRIBUTOR_STAKE_BPS     = 1000;  // 10%
     uint256 public constant MAX_CONTRIBUTOR_STAKE_BPS = 2000;  // 20%
+    // Slash 50% of stake if contributor abandons (never submits PR before deadline)
+    uint256 public constant ABANDON_SLASH_BPS         = 5000;  // 50%
 
     uint256 public constant DEFAULT_LOW_DURATION      = 14 days;
     uint256 public constant DEFAULT_MEDIUM_DURATION   = 30 days;
@@ -454,9 +462,8 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
     }
 
     /**
-     * @notice Step 3 — Org confirms the PR was merged on GitHub.
-     *                  Status advances to MERGED; contributor can now claim.
-     *                  Only the repo owner can call this.
+     * @notice Step 3a — Org confirms the PR was merged on GitHub.
+     *                   Status advances to MERGED; contributor can now claim.
      */
     function approveMerge(uint256 _bountyId)
         external
@@ -469,6 +476,43 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         b.status = BountyStatus.MERGED;
 
         emit MergeApproved(_bountyId, msg.sender, b.prUrl);
+    }
+
+    /**
+     * @notice Step 3b — Org rejects the submitted PR (bad fix, wrong approach, etc.).
+     *                   Contributor gets their full stake back — they did the work.
+     *                   Bounty is reopened so another contributor can attempt it.
+     *                   Only the repo owner can call this.
+     */
+    function rejectPR(uint256 _bountyId)
+        external
+        nonReentrant
+        bountyExists(_bountyId)
+    {
+        Bounty storage b = bounties[_bountyId];
+        require(msg.sender == repos[b.repoId].owner, "Only repo owner");
+        require(b.status == BountyStatus.PR_SUBMITTED, "No PR submitted");
+
+        address contributor = b.assignedTo;
+        uint256 stake       = b.contributorStake;
+        string memory prUrl = b.prUrl;
+
+        // Reopen bounty
+        b.status           = BountyStatus.OPEN;
+        b.assignedTo       = address(0);
+        b.deadline         = 0;
+        b.contributorStake = 0;
+        b.prUrl            = "";
+        b.prSubmittedAt    = 0;
+
+        repos[b.repoId].available += b.amount;
+        contributorStakes[contributor] -= stake;
+        _removeBountyFromContributor(contributor, _bountyId);
+
+        // Full stake returned — contributor made an honest attempt
+        payable(contributor).transfer(stake);
+
+        emit PRRejected(_bountyId, msg.sender, prUrl, stake);
     }
 
     /**
@@ -499,8 +543,14 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
 
     /**
      * @notice Deadline expired without the org approving a merge.
-     *         Contributor gets their stake back. Bounty reopens for someone else.
-     *         Callable when status is ASSIGNED or PR_SUBMITTED and deadline has passed.
+     *         Bounty reopens. Stake handling depends on how far the contributor got:
+     *
+     *         ASSIGNED (no PR submitted) — abandonment penalty:
+     *           50% of stake slashed → added to repo pool
+     *           50% of stake returned to contributor
+     *
+     *         PR_SUBMITTED (org never reviewed) — org's fault:
+     *           100% of stake returned to contributor
      */
     function claimExpiredBounty(uint256 _bountyId)
         external
@@ -518,6 +568,7 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         BountyStatus prevStatus = b.status;
         uint256 stake = b.contributorStake;
 
+        // Reset bounty to OPEN
         b.status           = BountyStatus.OPEN;
         b.assignedTo       = address(0);
         b.deadline         = 0;
@@ -525,14 +576,28 @@ contract MergeXBounty is ReentrancyGuard, Ownable, Pausable {
         b.prUrl            = "";
         b.prSubmittedAt    = 0;
 
-        // bounty reward goes back to repo pool so another contributor can take it
         repos[b.repoId].available += b.amount;
         contributorStakes[msg.sender] -= stake;
         _removeBountyFromContributor(msg.sender, _bountyId);
 
-        payable(msg.sender).transfer(stake);
+        uint256 stakeReturned;
+        uint256 slashedAmount;
 
-        emit BountyExpired(_bountyId, msg.sender, prevStatus);
+        if (prevStatus == BountyStatus.ASSIGNED) {
+            // Abandoned — never submitted a PR — slash 50%
+            slashedAmount  = (stake * ABANDON_SLASH_BPS) / 10000;
+            stakeReturned  = stake - slashedAmount;
+            // Slashed portion goes back into the repo's reward pool
+            repos[b.repoId].available += slashedAmount;
+        } else {
+            // PR was submitted but org didn't respond — full return
+            stakeReturned = stake;
+            slashedAmount = 0;
+        }
+
+        payable(msg.sender).transfer(stakeReturned);
+
+        emit BountyExpired(_bountyId, msg.sender, prevStatus, stakeReturned, slashedAmount);
     }
 
     /**
