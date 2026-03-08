@@ -212,25 +212,64 @@ describe("MergeXBounty", function () {
     ).to.be.revertedWith("PR not approved yet");
   });
 
+  // ── PR Rejection ──────────────────────────────────────────────────────────
+
+  it("org rejects PR — contributor gets full stake back, bounty reopens", async () => {
+    const bountyId = await setupPRSubmitted();
+    const stake = BOUNTY / 10n;
+
+    const before = await ethers.provider.getBalance(contributor.address);
+    await contract.connect(org).rejectPR(bountyId);
+    const after = await ethers.provider.getBalance(contributor.address);
+
+    expect(after - before).to.equal(stake); // full stake returned
+    const b = await contract.getBounty(bountyId);
+    expect(b.status).to.equal(0n); // OPEN
+    expect(b.prUrl).to.equal("");
+    expect(b.assignedTo).to.equal(ethers.ZeroAddress);
+  });
+
+  it("only repo owner can reject PR", async () => {
+    const bountyId = await setupPRSubmitted();
+    await expect(
+      contract.connect(other).rejectPR(bountyId)
+    ).to.be.revertedWith("Only repo owner");
+  });
+
+  it("cannot reject PR when none is submitted", async () => {
+    const bountyId = await setupAssigned();
+    await expect(
+      contract.connect(org).rejectPR(bountyId)
+    ).to.be.revertedWith("No PR submitted");
+  });
+
   // ── Expiry ─────────────────────────────────────────────────────────────────
 
-  it("contributor reclaims stake when deadline passes (ASSIGNED) — bounty reopens", async () => {
+  it("abandonment (no PR) — 50% stake slashed to repo pool, 50% returned, bounty reopens", async () => {
     const bountyId = await setupAssigned();
-    const stake = BOUNTY / 10n;
+    const stake = BOUNTY / 10n; // 10% of BOUNTY
 
     await ethers.provider.send("evm_increaseTime", [150 * 24 * 60 * 60 + 1]); // 150 days (hardDuration)
     await ethers.provider.send("evm_mine");
 
+    const repoBefore = (await contract.getRepo(1n)).available;
     const before = await ethers.provider.getBalance(contributor.address);
     const tx      = await contract.connect(contributor).claimExpiredBounty(bountyId);
     const receipt = await tx.wait();
     const after   = await ethers.provider.getBalance(contributor.address);
+    const repoAfter = (await contract.getRepo(1n)).available;
 
-    expect(after - before + receipt.gasUsed * tx.gasPrice).to.equal(stake);
+    const slashed  = stake / 2n;
+    const returned = stake - slashed;
+
+    // Contributor got back 50% of stake (minus gas)
+    expect(after - before + receipt.gasUsed * tx.gasPrice).to.equal(returned);
+    // Repo pool received the bounty amount back + the slashed 50%
+    expect(repoAfter - repoBefore).to.equal(BOUNTY + slashed);
     expect((await contract.getBounty(bountyId)).status).to.equal(0n); // OPEN again
   });
 
-  it("contributor reclaims stake when deadline passes (PR_SUBMITTED) — bounty reopens", async () => {
+  it("PR submitted but org never responded — full stake returned, bounty reopens", async () => {
     const bountyId = await setupPRSubmitted();
     const stake = BOUNTY / 10n;
 
@@ -239,9 +278,16 @@ describe("MergeXBounty", function () {
     await ethers.provider.send("evm_setNextBlockTimestamp", [latest.timestamp + 150 * 24 * 60 * 60 + 60]);
     await ethers.provider.send("evm_mine");
 
-    await contract.connect(contributor).claimExpiredBounty(bountyId);
-    expect((await contract.getBounty(bountyId)).status).to.equal(0n); // OPEN again
-    expect((await contract.getBounty(bountyId)).prUrl).to.equal("");
+    const before  = await ethers.provider.getBalance(contributor.address);
+    const tx      = await contract.connect(contributor).claimExpiredBounty(bountyId);
+    const receipt = await tx.wait();
+    const after   = await ethers.provider.getBalance(contributor.address);
+
+    // Full stake returned (no slash)
+    expect(after - before + receipt.gasUsed * tx.gasPrice).to.equal(stake);
+    const b = await contract.getBounty(bountyId);
+    expect(b.status).to.equal(0n); // OPEN again
+    expect(b.prUrl).to.equal("");
   });
 
   it("cannot expire before deadline", async () => {
