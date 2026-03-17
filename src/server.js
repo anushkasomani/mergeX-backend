@@ -113,7 +113,6 @@ const createGithubAppJwt = (appId, privateKey) => {
   return `${unsignedToken}.${signature}`;
 };
 
-
 const parseRepoInput = (repoInput) => {
   if (!repoInput || typeof repoInput !== "string") {
     return null;
@@ -488,8 +487,6 @@ app.get("/api/github/repo-snapshot", async (req, res) => {
     });
   }
 });
-
-// ── GitHub App Webhook ──────────────────────────────────────────────────────
 
 app.post("/api/github/create-issues", async (req, res) => {
   const { repoUrl, findings } = req.body;
