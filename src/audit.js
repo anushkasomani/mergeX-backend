@@ -6,7 +6,8 @@ import { Synapse, getChain } from "@filoz/synapse-sdk";
 import { createPublicClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { getPdpDataSets, getAllPieceMetadata } from "@filoz/synapse-core/warm-storage";
-import { calculate as calculatePieceCID } from "@filoz/synapse-core/piece";
+import { calculate as calculatePieceCID, parse as parsePieceCID } from "@filoz/synapse-core/piece";
+import { resolvePieceUrl } from "@filoz/synapse-core/piece";
 
 const STATUS_NAMES = ["OPEN", "ASSIGNED", "PR_SUBMITTED", "MERGED", "COMPLETED", "CANCELLED"];
 
@@ -158,6 +159,7 @@ async function listAuditLogsFromFilecoin({ repoUrl, limit = 50 }) {
         repoUrl: metadata.repoUrl || "",
         timestamp: metadata.timestamp || null,
         auditId: metadata.auditId || null,
+        legacy: !metadata.pieceCid,
         dataSetId: dataset.dataSetId.toString(),
         providerName: dataset.provider?.name || "",
         providerId: dataset.provider?.id?.toString?.() || "",
@@ -515,6 +517,67 @@ export function registerAuditRoutes(app, { githubRequest, getGithubAppPrivateKey
       return res.json({ entries });
     } catch (err) {
       console.error("audit-logs error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/audit-download", async (req, res) => {
+    try {
+      const { pieceCid } = req.query;
+      if (typeof pieceCid !== "string" || !pieceCid.trim()) {
+        return res.status(400).json({ error: "pieceCid is required" });
+      }
+
+      const { rpcUrl, chainId, account } = getFilecoinConfig();
+      const client = createPublicClient({
+        chain: getChain(chainId),
+        transport: http(rpcUrl),
+      });
+
+      const url = await resolvePieceUrl({
+        client,
+        address: account.address,
+        pieceCid: parsePieceCID(pieceCid.trim()),
+      });
+
+      const rsp = await fetch(url);
+      if (!rsp.ok) throw new Error(`Failed to fetch piece content (${rsp.status})`);
+
+      const buf = Buffer.from(await rsp.arrayBuffer());
+      res.setHeader("Content-Type", rsp.headers.get("content-type") || "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename=\"audit-${pieceCid.trim()}.json\"`);
+      return res.send(buf);
+    } catch (err) {
+      console.error("audit-download error:", err);
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get("/api/audit-content", async (req, res) => {
+    try {
+      const { pieceCid } = req.query;
+      if (typeof pieceCid !== "string" || !pieceCid.trim()) {
+        return res.status(400).json({ error: "pieceCid is required" });
+      }
+
+      const { rpcUrl, chainId, account } = getFilecoinConfig();
+      const client = createPublicClient({
+        chain: getChain(chainId),
+        transport: http(rpcUrl),
+      });
+
+      const url = await resolvePieceUrl({
+        client,
+        address: account.address,
+        pieceCid: parsePieceCID(pieceCid.trim()),
+      });
+
+      const rsp = await fetch(url);
+      if (!rsp.ok) throw new Error(`Failed to fetch piece content (${rsp.status})`);
+      const text = (await rsp.text()).trimEnd();
+      return res.json({ content: text });
+    } catch (err) {
+      console.error("audit-content error:", err);
       return res.status(500).json({ error: err.message });
     }
   });
