@@ -6,6 +6,7 @@ import { Synapse, getChain } from "@filoz/synapse-sdk";
 import { createPublicClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { getPdpDataSets, getAllPieceMetadata } from "@filoz/synapse-core/warm-storage";
+import { calculate as calculatePieceCID } from "@filoz/synapse-core/piece";
 
 const STATUS_NAMES = ["OPEN", "ASSIGNED", "PR_SUBMITTED", "MERGED", "COMPLETED", "CANCELLED"];
 
@@ -96,11 +97,13 @@ async function storeAuditOnFilecoin(report, repoUrl) {
   const auditId = crypto.randomUUID();
   const synapse = await getSynapseClient();
   const copies = Math.max(1, Number(process.env.SYNAPSE_COPIES || 1));
+  const calculatedCid = calculatePieceCID(bytes);
   const metadata = {
     source: "mergeX-audit",
     repoUrl: repoUrl || "",
     timestamp: new Date().toISOString(),
     auditId,
+    pieceCid: calculatedCid?.toString?.() ?? String(calculatedCid),
   };
 
   const upload = await uploadWithRetry(
